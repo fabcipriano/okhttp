@@ -63,6 +63,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.OkHttpClient
 import okhttp3.OkHttpClientTestRule
 import okhttp3.Protocol
@@ -567,6 +568,49 @@ class HttpOverHttp2Test(
     // Confirm that the connection was reused.
     assertThat(server.takeRequest().exchangeIndex).isEqualTo(0)
     assertThat(server.takeRequest().exchangeIndex).isEqualTo(1)
+  }
+
+  /**
+   * Regression test for https://github.com/square/okhttp/issues/9237
+   *
+   * Verifies that writeTimeout is effective in HTTP/2 when the server stalls and stops reading
+   * the request body. The server never sends H2 WINDOW_UPDATE frames, so the H2 flow control
+   * window (65535 bytes) is exhausted and writer.data() eventually blocks. The writeTimeout
+   * must interrupt this and throw SocketTimeoutException within the configured time.
+   *
+   * Without the fix in StreamTimeout.timedOut(), the write would block indefinitely because
+   * timedOut() only called closeLater() + sendDegradedPingLater(), which can wake up threads
+   * waiting in waitForIo() but cannot unblock a kernel socket write.
+   */
+  @Test
+  fun writeTimeoutIsEffectiveWhenServerStalls() {
+    // Server stalls immediately after receiving request headers: it never reads body data
+    // or sends H2 flow control updates, so the client's write will block.
+    server.enqueue(MockResponse.Builder().onRequestStart(Stall).build())
+
+    client =
+      client
+        .newBuilder()
+        .writeTimeout(Duration.ofMillis(500))
+        .build()
+
+    // A POST body larger than the default H2 flow control window (65535 bytes) ensures the
+    // client exhausts the window and blocks waiting for WINDOW_UPDATE (which never arrives).
+    val largeBody = ByteArray(128 * 1024) // 128 KB > 65535 byte default H2 window
+    val call =
+      client.newCall(
+        Request
+          .Builder()
+          .url(server.url("/"))
+          .post(largeBody.toRequestBody("application/octet-stream".toMediaType()))
+          .build(),
+      )
+
+    assertFailsWith<SocketTimeoutException> {
+      call.execute()
+    }.also { expected ->
+      assertThat(expected.message).isEqualTo("timeout")
+    }
   }
 
   /**

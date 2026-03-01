@@ -28,6 +28,7 @@ import assertk.assertions.isTrue
 import java.io.EOFException
 import java.io.IOException
 import java.io.InterruptedIOException
+import java.net.SocketTimeoutException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -1950,6 +1951,82 @@ class Http2ConnectionTest {
     watchdogJob.deadlineNanoTime(System.nanoTime()) // Due immediately!
     watchdogJob.enter()
     latch.await()
+  }
+
+  /**
+   * Regression test for https://github.com/square/okhttp/issues/9237
+   *
+   * Demonstrates the bug: when a write blocks at the TCP level (TCP receive buffer full because
+   * the peer has stopped reading), the writeTimeout cannot interrupt it unless the underlying
+   * socket is cancelled. The original StreamTimeout.timedOut() only called closeLater() and
+   * sendDegradedPingLater(), which cannot unblock a kernel-level socket write via notifyAll().
+   *
+   * This test verifies that writeTimeout is effective when the peer stops reading and the
+   * TCP receive buffer fills up, blocking writer.data() in the kernel.
+   */
+  @Test fun writeTimeoutIsEffectiveWhenPeerStopsReading() {
+    // Set up peer with a large H2 flow control window so TCP becomes the bottleneck,
+    // not H2 flow control. H2 flow control already works via waitForIo(); the bug is
+    // specifically about TCP-level blocking where notifyAll() cannot help.
+    val settings = Settings()
+    settings[Settings.INITIAL_WINDOW_SIZE] = 16 * 1024 * 1024 // 16 MB stream window
+    peer.sendFrame().settings(settings)
+    peer.acceptFrame() // Client SETTINGS ACK
+    // Increase connection-level flow control to 16 MB (starts at 65535).
+    peer.sendFrame().windowUpdate(0, (16 * 1024 * 1024 - 65535).toLong())
+    peer.acceptFrame() // PING (for synchronisation — ensures window update is processed)
+    peer.sendFrame().ping(true, Http2Connection.AWAIT_PING, 0) // PONG
+    peer.acceptFrame() // Client HEADERS from newStream()
+    // Script ends: peer stops reading. TCP receive buffer will fill up when client writes data.
+    peer.play()
+
+    val connection = connect(peer)
+    // writePingAndAwaitPong() guarantees all previously received frames (SETTINGS, WINDOW_UPDATE)
+    // have been fully processed by the reader before we start writing.
+    connection.writePingAndAwaitPong()
+
+    val stream = connection.newStream(headerEntries("a", "android"), true)
+    stream.writeTimeout().timeout(500, TimeUnit.MILLISECONDS)
+
+    // Write data larger than typical OS TCP receive buffers (~200 KB – 4 MB on Linux).
+    // The write will complete quickly until the peer's TCP receive buffer is full, then
+    // writer.data() will block in the kernel. The writeTimeout must cancel the socket
+    // to interrupt this blocking write and throw SocketTimeoutException.
+    assertFailsWith<SocketTimeoutException> {
+      val largeData = Buffer().write(ByteArray(8 * 1024 * 1024)) // 8 MB
+      stream.sink.write(largeData, largeData.size)
+      stream.sink.flush()
+    }.also { expected ->
+      assertThat(expected.message).isEqualTo("timeout")
+    }
+  }
+
+  /**
+   * Regression test for https://github.com/square/okhttp/issues/9237
+   *
+   * Verifies that readTimeout is effective when the server never sends a response
+   * (network blackhole scenario). This is the read-side equivalent of the write bug.
+   */
+  @Test fun readTimeoutIsEffectiveWhenPeerNeverSendsResponse() {
+    // Peer accepts a full request (HEADERS + END_STREAM) but never sends response headers.
+    peer.sendFrame().settings(Settings())
+    peer.acceptFrame() // Client SETTINGS ACK
+    peer.acceptFrame() // Client HEADERS (with END_STREAM)
+    // No response headers sent; peer script ends.
+    peer.play()
+
+    val connection = connect(peer)
+    // Create a stream with no request body (outFinished = true).
+    val stream = connection.newStream(headerEntries("a", "android"), false)
+    stream.readTimeout().timeout(500, TimeUnit.MILLISECONDS)
+
+    // takeHeaders() will block waiting for a response that never comes.
+    // The readTimeout must interrupt this and throw SocketTimeoutException.
+    assertFailsWith<SocketTimeoutException> {
+      stream.takeHeaders()
+    }.also { expected ->
+      assertThat(expected.message).isEqualTo("timeout")
+    }
   }
 
   private fun connectWithSettings(

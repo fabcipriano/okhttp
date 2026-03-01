@@ -725,6 +725,16 @@ class Http2Stream internal constructor(
     override fun timedOut() {
       closeLater(ErrorCode.CANCEL)
       connection.sendDegradedPingLater()
+      // Cancel the underlying socket to interrupt any blocking kernel I/O operations.
+      // Unlike HTTP/1.1 where Okio's default timedOut() closes the socket, HTTP/2 uses
+      // per-stream timeouts that cannot interrupt a TCP-level write via notifyAll() alone.
+      // Closing the socket here matches HTTP/1.1 behavior and is required to unblock a
+      // write that is stuck in the kernel (e.g. due to a network blackhole dropping ACKs).
+      try {
+        connection.socket.cancel()
+      } catch (_: Exception) {
+        // Ignore: socket may already be closed or cancelled.
+      }
     }
 
     override fun newTimeoutException(cause: IOException?): IOException =
